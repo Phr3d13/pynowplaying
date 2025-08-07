@@ -29,7 +29,13 @@ Real-time audio track identification system that recognizes music playing on you
    pip install sounddevice numpy pydub requests flask
    ```
 
-3. **Install optional Shazam support** (recommended):
+3. **For Python 3.13+ users** - install audioop replacement:
+   ```bash
+   pip install audioop-lts
+   ```
+   *Note: Python 3.13 removed the built-in `audioop` module. The `audioop-lts` package provides the same functionality.*
+
+4. **Install optional Shazam support** (recommended):
    ```bash
    pip install shazamio
    ```
@@ -168,6 +174,12 @@ pip install --upgrade pip
 pip install sounddevice numpy pydub requests flask shazamio
 ```
 
+**Python 3.13+ audioop issue**:
+```bash
+pip install audioop-lts
+```
+*The `audioop` module was removed in Python 3.13. This package restores the functionality.*
+
 **Audio backend issues** (Windows):
 ```bash
 pip install sounddevice --upgrade
@@ -211,7 +223,7 @@ This project uses multiple free APIs for music recognition. Consider:
 ## 📋 System Requirements
 
 - **OS**: Windows (tested), macOS/Linux (may work)
-- **Python**: 3.7 or higher
+- **Python**: 3.7 or higher (3.13+ requires `audioop-lts` package)
 - **RAM**: 512MB+ available
 - **Internet**: Required for music recognition APIs
 - **Audio**: Computer audio output/input device
