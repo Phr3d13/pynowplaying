@@ -1,0 +1,34 @@
+# Executables
+/ffmpeg.exe
+/fpcalc.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+temp_*.wav
+debug_audio_*.wav
+*.wav
+*.mp3
+
+# API Keys and secrets
+.env
+config.ini
+secrets.json
