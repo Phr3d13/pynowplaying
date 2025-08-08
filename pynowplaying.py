@@ -39,7 +39,7 @@ else:
 # === CONFIG ===
 ACOUSTID_API_KEY = 'YOUR_ACOUSTID_API_KEY_HERE'  # Get your free key from https://acoustid.org/
 DEVICE_NAME_CONTAINS = "Analogue 3 + 4"  # substring of your input device name, adjust as needed
-CHUNK_SECONDS = 5                   # length of each audio chunk for track identification (faster testing)
+CHUNK_SECONDS = 15                   # length of each audio chunk for track identification (faster testing)
 SAMPLE_RATE = 48000                # sample rate (Hz) - changed to 48kHz
 CHANNELS = 2                       # stereo
 
@@ -99,7 +99,7 @@ USE_ACOUSTID_FALLBACK = True       # AcoustID for full songs - RELIABLE LONG TER
 USE_MUSICBRAINZ_DIRECT = True      # Query MusicBrainz directly for enhanced metadata
 
 # AudD API configuration (free trial expires after ~2 weeks)
-AUDD_API_TOKEN = "your_token_here"            # Replace with your free API token from https://audd.io/
+AUDD_API_TOKEN = "fd225011ab1d3beec55ff2729a6a7ffe"            # Replace with your free API token from https://audd.io/
 
 # Shazam API configuration (free tier available)
 RAPIDAPI_KEY = "YOUR_RAPIDAPI_KEY_HERE"  # Get from RapidAPI for Shazam service
@@ -1229,8 +1229,15 @@ def lookup_audd_api(wav_data):
                         album_art_url = None
                         if 'apple_music' in track_info:
                             if track_info['apple_music'].get('artwork'):
-                                album_art_url = track_info['apple_music']['artwork'].get('url')
-                                print(f"DEBUG: Found Apple Music album art URL")
+                                raw_url = track_info['apple_music']['artwork'].get('url')
+                                if raw_url:
+                                    # Apple Music URLs contain {w}x{h} placeholders - replace with actual dimensions
+                                    if '{w}x{h}' in raw_url:
+                                        album_art_url = raw_url.replace('{w}x{h}', '512x512')
+                                        print(f"DEBUG: Fixed Apple Music album art URL: {album_art_url}")
+                                    else:
+                                        album_art_url = raw_url
+                                        print(f"DEBUG: Found Apple Music album art URL: {album_art_url}")
                             # Also get album from Apple Music if not found in main result
                             if album == 'Unknown Album' and track_info['apple_music'].get('collectionName'):
                                 album = track_info['apple_music']['collectionName']
@@ -1239,7 +1246,7 @@ def lookup_audd_api(wav_data):
                                 images = track_info['spotify']['album']['images']
                                 if images:
                                     album_art_url = images[0].get('url')  # Use largest image
-                                    print(f"DEBUG: Found Spotify album art URL")
+                                    print(f"DEBUG: Found Spotify album art URL: {album_art_url}")
                             # Also get album from Spotify if not found in main result  
                             if album == 'Unknown Album' and track_info['spotify'].get('album', {}).get('name'):
                                 album = track_info['spotify']['album']['name']
@@ -1300,15 +1307,18 @@ def identify_track_multiple_services(wav_data):
             if result and result.get('artist') and result.get('title'):
                 print(f"DEBUG: ✅ {service_name} success: {result['artist']} - {result['title']}")
                 
-                # If we don't have album art yet, try to fetch it
-                if not result.get('album_art'):
-                    print(f"DEBUG: 🖼️ Fetching album art for: {result['artist']} - {result['title']}")
+                # Check what album art we got from the service
+                if result.get('album_art'):
+                    print(f"DEBUG: 🖼️ {service_name} provided album art: {result['album_art']}")
+                else:
+                    print(f"DEBUG: 🖼️ {service_name} did not provide album art - trying fallback sources...")
+                    # If we don't have album art yet, try to fetch it
                     album_art = fetch_album_art(result['artist'], result['title'])
                     if album_art:
                         result['album_art'] = album_art
-                        print(f"DEBUG: ✅ Album art found!")
+                        print(f"DEBUG: ✅ Fallback album art found: {album_art}")
                     else:
-                        print(f"DEBUG: ❌ No album art found")
+                        print(f"DEBUG: ❌ No album art found from any fallback source")
                 
                 return result
             else:
@@ -1324,11 +1334,11 @@ def identify_track_multiple_services(wav_data):
 
 def fetch_album_art(artist, title):
     """Fetch album art from multiple free sources"""
-    # Try multiple sources in order of preference
+    # Try multiple sources in order of preference (iTunes first - most reliable)
     sources = [
+        ("iTunes", fetch_itunes_album_art),
         ("Last.fm", fetch_lastfm_album_art),
-        ("MusicBrainz", fetch_musicbrainz_album_art),
-        ("iTunes", fetch_itunes_album_art)
+        ("MusicBrainz", fetch_musicbrainz_album_art)
     ]
     
     for source_name, fetch_func in sources:
@@ -1336,7 +1346,7 @@ def fetch_album_art(artist, title):
             print(f"DEBUG: Trying {source_name} for album art...")
             album_art_url = fetch_func(artist, title)
             if album_art_url:
-                print(f"DEBUG: ✅ Found album art from {source_name}")
+                print(f"DEBUG: ✅ Found album art from {source_name}: {album_art_url}")
                 return album_art_url
             else:
                 print(f"DEBUG: ❌ No album art from {source_name}")
@@ -1424,7 +1434,7 @@ def fetch_itunes_album_art(artist, title):
             'term': f"{artist} {title}",
             'media': 'music',
             'entity': 'song',
-            'limit': 1
+            'limit': 5  # Get more results for better matching
         }
         
         response = requests.get(url, params=params, timeout=10)
@@ -1432,11 +1442,17 @@ def fetch_itunes_album_art(artist, title):
         data = response.json()
         
         if data.get('results'):
-            result = data['results'][0]
-            artwork_url = result.get('artworkUrl100')
-            if artwork_url:
-                # Convert to higher resolution by changing the size
-                return artwork_url.replace('100x100', '512x512')
+            # Try to find the best match
+            for result in data['results']:
+                artwork_url = result.get('artworkUrl100')
+                if artwork_url:
+                    # Convert to higher resolution by changing the size
+                    high_res_url = artwork_url.replace('100x100', '512x512')
+                    print(f"DEBUG: iTunes found artwork: {high_res_url}")
+                    return high_res_url
+            
+            # If no artwork found in any result, return None
+            print(f"DEBUG: iTunes found {len(data['results'])} results but no artwork")
     except Exception as e:
         print(f"DEBUG: iTunes Search API error: {e}")
     
