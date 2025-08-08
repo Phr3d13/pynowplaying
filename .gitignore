@@ -34,3 +34,4 @@ config.ini
 secrets.json
 ffplay.exe
 ffprobe.exe
+last_audio_device.json
