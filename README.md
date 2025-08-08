@@ -62,6 +62,33 @@ This gives you:
    - **Linux/macOS**: Install chromaprint package (`sudo apt install chromaprint-tools` on Ubuntu or `brew install chromaprint` on macOS)
    - **FFmpeg** (optional): Download from [FFmpeg](https://ffmpeg.org/download.html) for audio format conversion
 
+### 🐧 Debian/Ubuntu Linux Installation
+
+For Debian-based Linux distributions (Ubuntu, Debian, Linux Mint, etc.), you can use the system package manager instead of pip for most dependencies:
+
+```bash
+# Install Python packages using apt
+sudo apt update
+sudo apt install python3-sounddevice python3-numpy python3-pydub python3-requests python3-flask
+
+# Install audio tools
+sudo apt install chromaprint-tools ffmpeg
+
+# For optional Shazam support (may fail on some systems)
+pip3 install shazamio
+
+# For Python 3.13+ users only
+pip3 install audioop-lts
+```
+
+**Why use system packages?**
+- ✅ **Better integration** with system libraries
+- ✅ **Automatic dependency resolution** 
+- ✅ **No compilation issues** with native extensions
+- ✅ **Matches your system's Python version**
+
+**Note**: The `python-` prefix packages are for Python dependencies. Audio tools like `chromaprint-tools` don't need the prefix as they're system utilities.
+
 ### API Configuration (For Long-term Sustainability)
 
 For the best long-term experience, set up these completely free options:
