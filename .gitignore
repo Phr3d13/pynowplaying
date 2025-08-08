@@ -32,3 +32,5 @@ debug_audio_*.wav
 .env
 config.ini
 secrets.json
+ffplay.exe
+ffprobe.exe

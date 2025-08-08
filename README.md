@@ -9,15 +9,31 @@ Real-time audio track identification system that recognizes music playing on you
 - **Interactive Device Selection**: Choose from available audio input devices with testing
 - **Visual Audio Feedback**: VU meters and waveforms to verify audio capture
 - **Web Interface**: Clean web dashboard showing current track and history
-- **Windows Audio Integration**: Automatic detection of Windows default audio devices
-- **Free Tier Friendly**: Primary service (AudD) requires no signup or API keys
+- **Cross-Platform Support**: Works on Windows, Linux, and macOS
+- **Free API Options**: Primary service (AudD) has a generous free tier
 
 ## 🚀 Quick Start
+
+### ⚡ Sustainable Setup (Recommended)
+
+For a setup that works **forever for free**:
+
+```bash
+# Option 1: Try shazamio (best but may have installation issues)
+pip install shazamio
+
+# Option 2: If shazamio fails, use AcoustID only (reliable fallback)
+# Get a free AcoustID key from https://acoustid.org/ and configure it
+```
+
+This gives you:
+- **Shazam** (if installable): Excellent for partial track recognition (15-30 second clips)
+- **AcoustID**: Great for full songs (30+ seconds), free forever, **no complex dependencies**
 
 ### Prerequisites
 
 1. **Python 3.7+** installed on your system
-2. **Windows OS** (tested on Windows, may work on other platforms)
+2. **Cross-platform support**: Windows, Linux, or macOS
 3. **Audio playing** on your computer (music streaming, local files, etc.)
 
 ### Installation
@@ -35,14 +51,41 @@ Real-time audio track identification system that recognizes music playing on you
    ```
    *Note: Python 3.13 removed the built-in `audioop` module. The `audioop-lts` package provides the same functionality.*
 
-4. **Install optional Shazam support** (recommended):
+4. **Install optional Shazam support** (if possible):
    ```bash
    pip install shazamio
    ```
+   **Note**: If this fails with Rust/Cargo errors, skip it and use AcoustID instead (see configuration section).
 
-4. **Download audio tools**:
-   - Download `fpcalc.exe` from [AcoustID](https://acoustid.org/chromaprint) and place it in the project folder
-   - Download `ffmpeg.exe` from [FFmpeg](https://ffmpeg.org/download.html) and place it in the project folder
+5. **Download audio tools**:
+   - **Windows**: Download `fpcalc.exe` from [AcoustID](https://acoustid.org/chromaprint) and place it in the project folder
+   - **Linux/macOS**: Install chromaprint package (`sudo apt install chromaprint-tools` on Ubuntu or `brew install chromaprint` on macOS)
+   - **FFmpeg** (optional): Download from [FFmpeg](https://ffmpeg.org/download.html) for audio format conversion
+
+### API Configuration (For Long-term Sustainability)
+
+For the best long-term experience, set up these completely free options:
+
+1. **Shazam via shazamio** (Primary - Free Forever, but complex installation):
+   ```bash
+   pip install shazamio
+   ```
+   - No API key required
+   - Excellent recognition for partial tracks
+   - Completely free forever
+   - **⚠️ Requires Rust/Cargo - may fail on some systems**
+
+2. **AcoustID** (Reliable Fallback - Free Forever):
+   - Visit [https://acoustid.org/](https://acoustid.org/)
+   - Sign up for a free account (always free)
+   - Get your API key
+   - Edit `pynowplaying.py` and replace `ACOUSTID_API_KEY = 'YOUR_ACOUSTID_API_KEY_HERE'` with your key
+   - **✅ Simple installation, no complex dependencies**
+   - Works best with 30+ second samples
+
+3. **AudD API** (Temporary):
+   - Currently configured but free trial expires after ~2 weeks
+   - Good while it lasts, but not sustainable long-term
 
 ### Running the Application
 
@@ -171,7 +214,16 @@ Response:
 **Missing packages**:
 ```bash
 pip install --upgrade pip
-pip install sounddevice numpy pydub requests flask shazamio
+pip install sounddevice numpy pydub requests flask
+```
+
+**Shazamio installation fails (Rust/Cargo errors)**:
+```bash
+# If you get Rust/Cargo compilation errors, skip shazamio
+# Focus on AcoustID instead - it's simpler and reliable:
+# 1. Get free API key from https://acoustid.org/
+# 2. Edit ACOUSTID_API_KEY in pynowplaying.py
+# 3. Set USE_ACOUSTID_FALLBACK = True
 ```
 
 **Python 3.13+ audioop issue**:

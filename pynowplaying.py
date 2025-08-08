@@ -4,6 +4,8 @@ import time
 import json
 import threading
 import subprocess
+import platform
+import glob
 from datetime import datetime
 from io import BytesIO
 import asyncio
@@ -11,6 +13,7 @@ import asyncio
 import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
+from pydub.utils import which
 import requests
 from flask import Flask, render_template_string, jsonify
 
@@ -24,27 +27,88 @@ except ImportError:
     print("DEBUG: shazamio not available - install with: pip install shazamio")
     print("DEBUG: Falling back to AcoustID only")
 
+# Configure pydub to use local ffmpeg.exe
+if os.path.exists('ffmpeg.exe'):
+    AudioSegment.converter = os.path.abspath('ffmpeg.exe')
+    AudioSegment.ffmpeg = os.path.abspath('ffmpeg.exe')
+    AudioSegment.ffprobe = os.path.abspath('ffmpeg.exe')  # ffmpeg.exe often includes ffprobe functionality
+    print("DEBUG: Using local ffmpeg.exe for audio processing")
+else:
+    print("DEBUG: Warning - ffmpeg.exe not found in current directory")
+
 # === CONFIG ===
 ACOUSTID_API_KEY = 'YOUR_ACOUSTID_API_KEY_HERE'  # Get your free key from https://acoustid.org/
 DEVICE_NAME_CONTAINS = "Analogue 3 + 4"  # substring of your input device name, adjust as needed
-CHUNK_SECONDS = 15                  # length of each audio chunk for track identification
+CHUNK_SECONDS = 5                   # length of each audio chunk for track identification (faster testing)
 SAMPLE_RATE = 48000                # sample rate (Hz) - changed to 48kHz
 CHANNELS = 2                       # stereo
-FP_CALC_PATH = 'fpcalc.exe'        # full path to fpcalc CLI tool if not in PATH
+
+# Platform-specific configuration
+CURRENT_PLATFORM = platform.system()
+if CURRENT_PLATFORM == "Windows":
+    FP_CALC_PATH = 'fpcalc.exe'    # Windows executable
+elif CURRENT_PLATFORM == "Darwin":  # macOS
+    FP_CALC_PATH = 'fpcalc'        # macOS/Linux executable
+else:  # Linux and others
+    FP_CALC_PATH = 'fpcalc'        # Linux executable
+
 DEBUG_SAVE_AUDIO = False            # Save audio samples for debugging
 
+def cleanup_temp_files():
+    """Remove any leftover temporary files from previous runs"""
+    temp_patterns = [
+        "temp_*.wav",
+        "debug_audio_*.wav", 
+        "temp_fpcalc.wav",
+        "temp_shazam_*.wav",
+        "temp_audd_*.wav",
+        "temp_acoustid_*.wav"
+    ]
+    
+    removed_count = 0
+    for pattern in temp_patterns:
+        try:
+            for file_path in glob.glob(pattern):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"DEBUG: Removed leftover temp file: {file_path}")
+                    removed_count += 1
+        except Exception as e:
+            print(f"DEBUG: Could not remove temp file {pattern}: {e}")
+    
+    if removed_count > 0:
+        print(f"DEBUG: Cleaned up {removed_count} temporary files from previous runs")
+    
+    return removed_count
+
+def cleanup_on_exit():
+    """Cleanup function to run when the program exits"""
+    print("DEBUG: Performing final cleanup...")
+    removed = cleanup_temp_files()
+    if removed > 0:
+        print(f"DEBUG: Final cleanup removed {removed} temporary files")
+
+# Register cleanup function to run on program exit
+import atexit
+atexit.register(cleanup_on_exit)
+
 # Track identification service selection
-USE_AUDD_API = True                # Use AudD API (free, no signup required) - PRIMARY
-USE_SHAZAM_API = False             # Use Shazam-like identification (requires shazamio)
-USE_ACOUSTID_FALLBACK = False      # Fallback to AcoustID for full songs
+USE_AUDD_API = True                # Use AudD API (free tier expires after ~2 weeks)
+USE_SHAZAM_API = True              # Use Shazam-like identification (requires shazamio - may fail to install)
+USE_ACOUSTID_FALLBACK = True       # AcoustID for full songs - RELIABLE LONG TERM SOLUTION (no complex deps)
 USE_MUSICBRAINZ_DIRECT = True      # Query MusicBrainz directly for enhanced metadata
+
+# AudD API configuration (free trial expires after ~2 weeks)
+AUDD_API_TOKEN = "your_token_here"            # Replace with your free API token from https://audd.io/
 
 # Shazam API configuration (free tier available)
 RAPIDAPI_KEY = "YOUR_RAPIDAPI_KEY_HERE"  # Get from RapidAPI for Shazam service
 
 # === GLOBAL STATE ===
-current_track = {"artist": "", "title": "", "time": ""}
+current_track = {"artist": "", "title": "", "time": "", "album_art": "", "album": ""}
 track_history = []
+last_identified_track = None  # Track the last identified song for consecutive match detection
+consecutive_match_count = 0   # Count consecutive matches of the same song
 
 # Flask app to serve webpage
 app = Flask(__name__)
@@ -57,31 +121,168 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8" />
     <title>Now Playing</title>
     <style>
-        body { background: #111; color: #eee; font-family: Arial, sans-serif; padding: 20px; }
-        h1 { font-size: 2em; }
-        #current { margin-bottom: 20px; }
-        #history { font-size: 0.9em; max-height: 300px; overflow-y: auto; }
-        .track { margin-bottom: 5px; }
-        .timestamp { color: #666; margin-right: 10px; }
+        body { 
+            background: #111; 
+            color: #eee; 
+            font-family: Arial, sans-serif; 
+            padding: 20px; 
+            margin: 0;
+        }
+        h1 { 
+            font-size: 2em; 
+            margin-top: 0;
+        }
+        #current { 
+            margin-bottom: 30px; 
+            display: flex; 
+            align-items: flex-start; 
+            gap: 20px; 
+            flex-wrap: nowrap;
+        }
+        #album-art { 
+            width: 150px; 
+            height: 150px; 
+            border-radius: 8px; 
+            background: #333; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            flex-shrink: 0;
+            overflow: hidden;
+            position: relative;
+        }
+        #album-art img { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; 
+            border-radius: 8px; 
+            display: block;
+        }
+        #album-art .no-art {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            display: none;
+        }
+        #album-art.has-error .no-art {
+            display: block;
+        }
+        #album-art.has-error img {
+            display: none;
+        }
+        #track-info { 
+            flex: 1; 
+            min-width: 0;
+            padding-left: 10px;
+        }
+        #track-info h1 {
+            margin-bottom: 10px;
+            line-height: 1.2;
+        }
+        #track-info p {
+            margin: 8px 0;
+            line-height: 1.4;
+        }
+        #history { 
+            font-size: 0.9em; 
+            max-height: 300px; 
+            overflow-y: auto; 
+        }
+        .track { 
+            margin-bottom: 8px; 
+            display: flex; 
+            align-items: center; 
+            gap: 12px; 
+        }
+        .track-art { 
+            width: 30px; 
+            height: 30px; 
+            border-radius: 4px; 
+            background: #333; 
+            flex-shrink: 0; 
+            overflow: hidden;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .track-art img { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; 
+            border-radius: 4px; 
+            display: block;
+        }
+        .track-art .no-art {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            display: none;
+        }
+        .track-art.has-error .no-art {
+            display: block;
+        }
+        .track-art.has-error img {
+            display: none;
+        }
+        .track-details { 
+            flex: 1; 
+            min-width: 0;
+        }
+        .timestamp { 
+            color: #666; 
+            margin-right: 10px; 
+        }
+        .no-art { 
+            color: #666; 
+            font-size: 0.8em; 
+            text-align: center;
+        }
     </style>
     <meta http-equiv="refresh" content="5" />
 </head>
 <body>
     <div id="current">
-        <h1>Now Playing:</h1>
-        {% if track.artist and track.title %}
-          <p><strong>{{ track.artist }} - {{ track.title }}</strong></p>
-          <p><em>Started at {{ track.time }}</em></p>
-        {% else %}
-          <p><em>No track detected yet</em></p>
-        {% endif %}
+        <div id="album-art">
+            {% if track.album_art %}
+                <img src="{{ track.album_art }}" alt="Album Art" onerror="this.parentElement.classList.add('has-error');">
+                <span class="no-art">🎵</span>
+            {% else %}
+                <span class="no-art">🎵</span>
+            {% endif %}
+        </div>
+        <div id="track-info">
+            <h1>Now Playing:</h1>
+            {% if track.artist and track.title %}
+              <p><strong>{{ track.artist }} - {{ track.title }}</strong></p>
+              {% if track.album and track.album != 'Unknown Album' %}
+                <p><em>Album: {{ track.album }}</em></p>
+              {% else %}
+                <p><em>Started at {{ track.time }}</em></p>
+              {% endif %}
+            {% else %}
+              <p><em>No track detected yet</em></p>
+            {% endif %}
+        </div>
     </div>
     <div id="history">
         <h2>History</h2>
         {% for t in history %}
             <div class="track">
-                <span class="timestamp">{{ t.time }}</span>
-                <span>{{ t.artist }} - {{ t.title }}</span>
+                <div class="track-art">
+                    {% if t.album_art %}
+                        <img src="{{ t.album_art }}" alt="Album Art" onerror="this.parentElement.classList.add('has-error');">
+                        <span class="no-art">♪</span>
+                    {% else %}
+                        <span class="no-art">♪</span>
+                    {% endif %}
+                </div>
+                <div class="track-details">
+                    <span class="timestamp">{{ t.time }}</span>
+                    <span>{{ t.artist }} - {{ t.title }}</span>
+                </div>
             </div>
         {% endfor %}
     </div>
@@ -89,14 +290,15 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def get_windows_default_input_device():
-    """Get the Windows default audio input device"""
+def get_default_input_device():
+    """Get the system default audio input device (cross-platform)"""
     try:
         # sounddevice uses the default device when device=None
         # We can get the default device info
         default_device = sd.query_devices(kind='input')
         if default_device:
-            print(f"DEBUG: Windows default input device: {default_device['name']}")
+            platform_name = "Windows" if CURRENT_PLATFORM == "Windows" else CURRENT_PLATFORM
+            print(f"DEBUG: {platform_name} default input device: {default_device['name']}")
             return default_device
         return None
     except Exception as e:
@@ -104,9 +306,9 @@ def get_windows_default_input_device():
         return None
 
 def find_default_device_index():
-    """Find the index of the Windows default input device"""
+    """Find the index of the system default input device (cross-platform)"""
     try:
-        default_device_info = get_windows_default_input_device()
+        default_device_info = get_default_input_device()
         if not default_device_info:
             return None
             
@@ -164,53 +366,135 @@ def check_device_sample_rate(device_index, target_rate=48000):
         print(f"      DEBUG: Device query failed: {e}")
         return False
 
+def get_platform_audio_hints():
+    """Get platform-specific audio device hints"""
+    if CURRENT_PLATFORM == "Windows":
+        return [
+            "💡 HINT: For music detection on Windows, you typically want:",
+            "   - 'Stereo Mix' or 'What U Hear' (captures what's playing)",
+            "   - NOT a microphone (captures external sound)",
+            "   - A loopback device from your audio interface"
+        ]
+    elif CURRENT_PLATFORM == "Linux":
+        return [
+            "💡 HINT: For music detection on Linux, you typically want:",
+            "   - PulseAudio monitor device (captures system audio)",
+            "   - ALSA loopback device (e.g., 'hw:Loopback,1,0')",
+            "   - Jack monitor or loopback port",
+            "   - NOT a microphone (captures external sound)"
+        ]
+    elif CURRENT_PLATFORM == "Darwin":  # macOS
+        return [
+            "💡 HINT: For music detection on macOS, you typically want:",
+            "   - Aggregate device with built-in output as source",
+            "   - Loopback software (like Loopback or SoundFlower)",
+            "   - BlackHole virtual audio device",
+            "   - NOT a microphone (captures external sound)"
+        ]
+    else:
+        return [
+            "💡 HINT: For music detection, you typically want:",
+            "   - A device that captures system audio output",
+            "   - NOT a microphone (captures external sound)",
+            "   - Check your OS documentation for loopback/monitor devices"
+        ]
+
+def get_service_recommendations():
+    """Get recommendations for sustainable, long-term free services"""
+    recommendations = []
+    
+    if SHAZAMIO_AVAILABLE:
+        recommendations.append("✅ Shazam (via shazamio) - Completely free forever")
+    else:
+        recommendations.append("❌ Shazam not available - may have Rust/Cargo installation issues")
+        recommendations.append("💡 Alternative: Focus on AcoustID (simpler, reliable)")
+    
+    if ACOUSTID_API_KEY != 'YOUR_ACOUSTID_API_KEY_HERE':
+        recommendations.append("✅ AcoustID - Free forever (requires 30+ second samples)")
+    else:
+        recommendations.append("⚠️  AcoustID - Get free API key from https://acoustid.org/")
+    
+    recommendations.append("⏰ AudD API - Free trial (~2 weeks), then requires payment")
+    
+    return recommendations
+
+def print_service_status():
+    """Print current service status and recommendations"""
+    print("\n" + "="*60)
+    print("SERVICE STATUS & SUSTAINABILITY")
+    print("="*60)
+    
+    recommendations = get_service_recommendations()
+    for rec in recommendations:
+        print(f"  {rec}")
+    
+    print("\n💡 For long-term use:")
+    if not SHAZAMIO_AVAILABLE:
+        print("  🎯 SHAZAMIO INSTALLATION FAILED:")
+        print("     - Skip shazamio for now (complex Rust dependencies)")
+        print("     - Focus on AcoustID: https://acoustid.org/ (simple, reliable)")
+        print("     - Use AudD while trial lasts")
+    else:
+        print("  1. Install shazamio: pip install shazamio")
+        print("  2. Get AcoustID key: https://acoustid.org/ (free forever)")
+        print("  3. Use AudD while trial lasts, then switch to Shazam+AcoustID")
+    print("="*60)
+
+def get_device_type_indicator(device_name):
+    """Get a platform-aware device type indicator"""
+    name_lower = device_name.lower()
+    
+    # Microphone detection (universal)
+    if 'microphone' in name_lower or 'mic' in name_lower:
+        return '🎤 MICROPHONE'
+    
+    # Platform-specific loopback/monitor device detection
+    if CURRENT_PLATFORM == "Windows":
+        windows_loopback = ['stereo mix', 'what u hear', 'loopback', 'mix', 'wave out']
+        if any(x in name_lower for x in windows_loopback):
+            return '🔊 LINE/LOOPBACK'
+    elif CURRENT_PLATFORM == "Linux":
+        linux_monitor = ['monitor', 'loopback', 'pulse', 'alsa']
+        if any(x in name_lower for x in linux_monitor):
+            return '🔊 MONITOR/LOOPBACK'
+    elif CURRENT_PLATFORM == "Darwin":  # macOS
+        macos_virtual = ['blackhole', 'soundflower', 'loopback', 'aggregate']
+        if any(x in name_lower for x in macos_virtual):
+            return '🔊 VIRTUAL/LOOPBACK'
+    
+    # Generic fallback detection
+    if any(x in name_lower for x in ['loopback', 'monitor', 'mix', 'virtual']):
+        return '🔊 SYSTEM AUDIO'
+    
+    return '❓ UNKNOWN'
+
 def find_input_device():
     global SAMPLE_RATE
     devices = sd.query_devices()
     
-    # First, try to find the Windows default input device
+    # First, try to find the system default input device
     default_device_index = find_default_device_index()
     
     print(f"DEBUG: Looking for device containing '{DEVICE_NAME_CONTAINS}' with {SAMPLE_RATE}Hz support")
     if default_device_index is not None:
         default_device = devices[default_device_index]
-        print(f"DEBUG: Windows default input device: [{default_device_index}] {default_device['name']}")
+        platform_name = "Windows" if CURRENT_PLATFORM == "Windows" else CURRENT_PLATFORM
+        print(f"DEBUG: {platform_name} default input device: [{default_device_index}] {default_device['name']}")
     
-    print("DEBUG: Available input devices:")
+    print("DEBUG: Scanning for compatible input devices...")
     input_devices = []
     
-    print("\nDEBUG: === DETAILED DEVICE ANALYSIS ===")
+    # Collect all compatible devices without verbose output
     for i, dev in enumerate(devices):
         if dev['max_input_channels'] > 0:
-            print(f"\nDevice [{i}]: {dev['name']}")
-            print(f"  Type: {'🎤 MICROPHONE' if 'microphone' in dev['name'].lower() or 'mic' in dev['name'].lower() else '🔊 LINE/LOOPBACK' if any(x in dev['name'].lower() for x in ['stereo mix', 'what u hear', 'loopback', 'mix', 'wave out']) else '❓ UNKNOWN'}")
-            print(f"  Channels: {dev['max_input_channels']} input, {dev['max_output_channels']} output")
-            print(f"  Default Rate: {dev['default_samplerate']} Hz")
-            print(f"  Host API: {sd.query_hostapis(dev['hostapi'])['name']}")
-            
             # Check if device supports our target sample rate
             supports_target_rate = check_device_sample_rate(i, SAMPLE_RATE)
-            rate_indicator = "✅" if supports_target_rate else "❌"
-            
-            # Mark if this is the Windows default device
-            default_indicator = " 🎯 [WINDOWS DEFAULT]" if i == default_device_index else ""
-            
-            print(f"  {SAMPLE_RATE}Hz Support: {rate_indicator}")
-            print(f"  Status: {default_indicator}")
             
             # Only add devices that support our target sample rate
             if supports_target_rate:
                 input_devices.append((i, dev))
-            else:
-                print(f"  ⚠️  Skipping - doesn't support {SAMPLE_RATE}Hz")
     
-    print(f"\nDEBUG: === END DEVICE ANALYSIS ===")
-    print(f"\n💡 HINT: For music detection, you typically want:")
-    print(f"   - 'Stereo Mix' or 'What U Hear' (captures what's playing)")
-    print(f"   - NOT a microphone (captures external sound)")
-    print(f"   - A loopback device from your audio interface")
-    
-    print(f"\nDEBUG: Found {len(input_devices)} input devices supporting {SAMPLE_RATE}Hz")
+    print(f"DEBUG: Found {len(input_devices)} input devices supporting {SAMPLE_RATE}Hz")
     
     if len(input_devices) == 0:
         print(f"\n❌ ERROR: No devices found that support {SAMPLE_RATE}Hz!")
@@ -232,7 +516,7 @@ def find_input_device():
             all_devices = []
             for i, dev in enumerate(devices):
                 if dev['max_input_channels'] > 0:
-                    default_indicator = " 🎯 [WINDOWS DEFAULT]" if i == default_device_index else ""
+                    default_indicator = f" 🎯 [{CURRENT_PLATFORM.upper()} DEFAULT]" if i == default_device_index else ""
                     print(f"  [{i}] {dev['name']}{default_indicator}")
                     print(f"      Channels: {dev['max_input_channels']}")
                     print(f"      Default Rate: {dev['default_samplerate']} Hz")
@@ -255,19 +539,19 @@ def find_input_device():
         sys.exit(1)
     
     # Determine priority order for auto-selection:
-    # 1. Windows default device that supports sample rate
+    # 1. System default device that supports sample rate
     # 2. Device matching DEVICE_NAME_CONTAINS
     # 3. First available device
     
     auto_selected = None
     selection_reason = ""
     
-    # Check if Windows default device supports our sample rate
+    # Check if system default device supports our sample rate
     if default_device_index is not None:
         for i, dev in input_devices:
             if i == default_device_index:
                 auto_selected = i
-                selection_reason = f"Windows default input device"
+                selection_reason = f"{CURRENT_PLATFORM} default input device"
                 break
     
     # If default device not available, try DEVICE_NAME_CONTAINS (prioritize exact match)
@@ -309,14 +593,51 @@ def find_input_device():
     print(f"{'='*60}")
     
     if auto_selected is not None:
-        use_auto = input(f"Use auto-selected device [{auto_selected}]? (y/n/s for selector): ").lower()
+        selected_device = devices[auto_selected]
+        device_type = get_device_type_indicator(selected_device['name'])
+        default_indicator = f" 🎯 [{CURRENT_PLATFORM.upper()} DEFAULT]" if auto_selected == default_device_index else ""
+        
+        print(f"Recommended device:")
+        print(f"  [{auto_selected}] {selected_device['name']}{default_indicator}")
+        print(f"  Type: {device_type}")
+        print(f"  Reason: {selection_reason}")
+        
+        # Show platform-specific hints
+        hints = get_platform_audio_hints()
+        print(f"\n💡 Quick Tips:")
+        for hint in hints[:2]:  # Just show first 2 hints
+            print(f"  {hint}")
+        
+        use_auto = input(f"\nUse recommended device? (y/n/s for all devices/t to test): ").lower()
         if use_auto == 'y':
             return auto_selected
         elif use_auto == 'n':
             print("Exiting...")
             sys.exit(1)
+        elif use_auto == 't':
+            print("Testing recommended device...")
+            print("Make sure audio is playing and press Enter to start test...")
+            input("Press Enter to continue...")
+            
+            is_good = test_audio_source(auto_selected)
+            if is_good:
+                use_tested = input(f"\n✅ Device test passed! Use this device? (y/n/s for selector): ").lower()
+                if use_tested == 'y':
+                    return auto_selected
+                elif use_tested == 'n':
+                    print("Exiting...")
+                    sys.exit(1)
+                # 's' falls through to selector
+            else:
+                print("\n❌ Device test failed.")
+                use_selector = input("Show device selector? (y/n): ").lower()
+                if use_selector != 'y':
+                    print("Exiting...")
+                    sys.exit(1)
+        # 's' or failed test falls through to selector
     else:
-        use_selector = input("No device auto-selected. Use interactive selector? (y/n): ").lower()
+        print("No suitable device auto-selected.")
+        use_selector = input("Show device selector? (y/n): ").lower()
         if use_selector != 'y':
             print("Exiting...")
             sys.exit(1)
@@ -325,8 +646,32 @@ def find_input_device():
 
 def select_audio_device(input_devices):
     """Interactive audio device selector with testing capability"""
-    # Get Windows default device index for highlighting
+    # Get default device index for highlighting
     default_device_index = find_default_device_index()
+    devices = sd.query_devices()
+    
+    # Show detailed device analysis when user requests full selector
+    print(f"\n{'='*60}")
+    print(f"DETAILED DEVICE ANALYSIS ({CURRENT_PLATFORM})")
+    print(f"{'='*60}")
+    
+    for device_index, dev in input_devices:
+        print(f"\nDevice [{device_index}]: {dev['name']}")
+        print(f"  Type: {get_device_type_indicator(dev['name'])}")
+        print(f"  Channels: {dev['max_input_channels']} input, {dev['max_output_channels']} output")
+        print(f"  Default Rate: {dev['default_samplerate']} Hz")
+        print(f"  Host API: {sd.query_hostapis(dev['hostapi'])['name']}")
+        
+        # Mark if this is the system default device
+        default_indicator = f" 🎯 [{CURRENT_PLATFORM.upper()} DEFAULT]" if device_index == default_device_index else ""
+        if default_indicator:
+            print(f"  Status:{default_indicator}")
+    
+    # Show platform-specific hints
+    hints = get_platform_audio_hints()
+    print(f"\n💡 Platform Hints:")
+    for hint in hints:
+        print(hint)
     
     while True:
         print(f"\n{'='*60}")
@@ -335,9 +680,10 @@ def select_audio_device(input_devices):
         print(f"Available input devices (all support {SAMPLE_RATE}Hz):")
         
         for idx, (device_index, dev) in enumerate(input_devices):
-            default_indicator = " 🎯 [WINDOWS DEFAULT]" if device_index == default_device_index else ""
+            default_indicator = f" 🎯 DEFAULT" if device_index == default_device_index else ""
+            device_type = get_device_type_indicator(dev['name'])
             print(f"  {idx + 1}. [{device_index}] {dev['name']}{default_indicator}")
-            print(f"      Channels: {dev['max_input_channels']}, Default Rate: {dev['default_samplerate']} Hz")
+            print(f"      Type: {device_type}")
         
         print(f"\nOptions:")
         print(f"  1-{len(input_devices)}: Select device")
@@ -356,8 +702,8 @@ def select_audio_device(input_devices):
                 test_idx = int(choice[1:]) - 1
                 if 0 <= test_idx < len(input_devices):
                     device_index, dev = input_devices[test_idx]
-                    default_indicator = " (Windows Default)" if device_index == default_device_index else ""
-                    print(f"\nTesting device [{device_index}]: {dev['name']}{default_indicator} at {SAMPLE_RATE}Hz")
+                    device_type = get_device_type_indicator(dev['name'])
+                    print(f"\nTesting device [{device_index}]: {dev['name']}{device_type} at {SAMPLE_RATE}Hz")
                     print("Make sure audio is playing and press Enter to start test...")
                     input("Press Enter to continue...")
                     
@@ -380,8 +726,8 @@ def select_audio_device(input_devices):
             selected_idx = int(choice) - 1
             if 0 <= selected_idx < len(input_devices):
                 device_index, dev = input_devices[selected_idx]
-                default_indicator = " (Windows Default)" if device_index == default_device_index else ""
-                print(f"\nSelected device [{device_index}]: {dev['name']}{default_indicator} ({SAMPLE_RATE}Hz)")
+                device_type = get_device_type_indicator(dev['name'])
+                print(f"\nSelected device [{device_index}]: {dev['name']}{device_type} ({SAMPLE_RATE}Hz)")
                 
                 # Ask if they want to test it first
                 test_first = input("Test this device before using? (y/n): ").lower()
@@ -662,6 +1008,7 @@ def record_chunk(device_index):
                     f.write(wav_data)
                 print(f"DEBUG: Saved audio sample to {debug_filename} for manual inspection")
                 print(f"DEBUG: You can play this file to verify it contains the correct audio")
+                print(f"DEBUG: ⚠️  Remember to delete debug files when done: debug_audio_*.wav")
             except Exception as e:
                 print(f"DEBUG: Could not save debug audio: {e}")
         
@@ -759,16 +1106,53 @@ def lookup_shazam(wav_data):
                     f.write(wav_data)
                 
                 print(f"DEBUG: Analyzing audio with Shazam...")
-                result = await shazam.recognize_song(temp_filename)
+                result = await shazam.recognize(temp_filename)
                 
                 if result and 'track' in result:
                     track = result['track']
                     artist = track.get('subtitle', 'Unknown Artist')
                     title = track.get('title', 'Unknown Title')
+                    album = track.get('sections', [{}])[0].get('metadata', [{}])[0].get('text', 'Unknown Album') if 'sections' in track else 'Unknown Album'
+                    
+                    # Try alternative album field locations in Shazam response
+                    if album == 'Unknown Album':
+                        # Check if there's album info in hub or other sections
+                        if 'hub' in track and 'displayname' in track['hub']:
+                            album = track['hub']['displayname']
+                        elif 'albumadamid' in track:
+                            album = 'Album Available'  # Placeholder when ID exists but name not provided
                     
                     if artist != 'Unknown Artist' and title != 'Unknown Title':
                         print(f"DEBUG: Shazam identified: {artist} - {title}")
-                        return {'artist': artist, 'title': title, 'source': 'shazam'}
+                        
+                        # Extract album art if available
+                        album_art = None
+                        if 'images' in track:
+                            images = track['images']
+                            print(f"DEBUG: Shazam images available: {list(images.keys())}")
+                            # Shazam provides various image types - prefer high quality
+                            if 'coverarthq' in images:
+                                album_art = images['coverarthq']
+                                print(f"DEBUG: ✅ Found Shazam HQ cover art: {album_art}")
+                            elif 'coverart' in images:
+                                album_art = images['coverart']
+                                print(f"DEBUG: ✅ Found Shazam cover art: {album_art}")
+                            elif 'background' in images:
+                                album_art = images['background']
+                                print(f"DEBUG: ✅ Found Shazam background art: {album_art}")
+                        else:
+                            print(f"DEBUG: ❌ No 'images' field in Shazam response")
+                        
+                        if not album_art:
+                            print(f"DEBUG: ❌ No album art found in Shazam response")
+                        
+                        return {
+                            'artist': artist, 
+                            'title': title, 
+                            'service': 'Shazam',
+                            'album_art': album_art,
+                            'album': album
+                        }
                 
                 print("DEBUG: Shazam could not identify track")
                 return None
@@ -804,12 +1188,27 @@ def lookup_audd_api(wav_data):
             with open(temp_filename, "rb") as f:
                 files = {'file': f}
                 data = {
-                    'api_token': 'test',  # Free tier - no signup required!
+                    'api_token': AUDD_API_TOKEN,  # Use configured API token
                     'return': 'apple_music,spotify'  # Get additional metadata
                 }
                 
-                print(f"DEBUG: Uploading to AudD API (free tier)...")
+                print(f"DEBUG: Uploading to AudD API...")
                 response = requests.post(url, files=files, data=data, timeout=30)
+                
+                # Handle rate limiting and expiration
+                if response.status_code == 429:
+                    print(f"DEBUG: ❌ AudD API rate limit exceeded!")
+                    print(f"DEBUG: 💡 Get a free API key from https://audd.io/ for higher limits")
+                    return None
+                elif response.status_code == 403:
+                    print(f"DEBUG: ❌ AudD API access denied - API key may have expired")
+                    print(f"DEBUG: 💡 Free tier expires after ~2 weeks. Consider using Shazam (free forever)")
+                    return None
+                elif response.status_code == 402:
+                    print(f"DEBUG: ❌ AudD API payment required - free trial expired")
+                    print(f"DEBUG: 💡 Switching to Shazam (completely free) is recommended")
+                    return None
+                
                 response.raise_for_status()
                 
                 result = response.json()
@@ -823,13 +1222,35 @@ def lookup_audd_api(wav_data):
                     if artist != 'Unknown Artist' and title != 'Unknown Title':
                         print(f"DEBUG: ✅ AudD identified: {artist} - {title}")
                         
-                        # Check for additional metadata
-                        if 'apple_music' in track_info:
-                            print(f"DEBUG: Additional info: Apple Music URL available")
-                        if 'spotify' in track_info:
-                            print(f"DEBUG: Additional info: Spotify info available")
+                        # Extract album information
+                        album = track_info.get('album', 'Unknown Album')
                         
-                        return {'artist': artist, 'title': title, 'source': 'audd'}
+                        # Check for additional metadata and album art
+                        album_art_url = None
+                        if 'apple_music' in track_info:
+                            if track_info['apple_music'].get('artwork'):
+                                album_art_url = track_info['apple_music']['artwork'].get('url')
+                                print(f"DEBUG: Found Apple Music album art URL")
+                            # Also get album from Apple Music if not found in main result
+                            if album == 'Unknown Album' and track_info['apple_music'].get('collectionName'):
+                                album = track_info['apple_music']['collectionName']
+                        elif 'spotify' in track_info:
+                            if track_info['spotify'].get('album', {}).get('images'):
+                                images = track_info['spotify']['album']['images']
+                                if images:
+                                    album_art_url = images[0].get('url')  # Use largest image
+                                    print(f"DEBUG: Found Spotify album art URL")
+                            # Also get album from Spotify if not found in main result  
+                            if album == 'Unknown Album' and track_info['spotify'].get('album', {}).get('name'):
+                                album = track_info['spotify']['album']['name']
+                        
+                        return {
+                            'artist': artist, 
+                            'title': title, 
+                            'service': 'AudD',
+                            'album_art': album_art_url,
+                            'album': album
+                        }
                     else:
                         print("DEBUG: AudD returned empty artist/title")
                 else:
@@ -851,20 +1272,26 @@ def identify_track_multiple_services(wav_data):
     print("DEBUG: === TRACK IDENTIFICATION ===")
     print("DEBUG: Trying multiple services for partial track recognition...")
     
-    # Service priority order - AudD first since it's working well and free
+    # Service priority order - Prioritize what's actually available
     services = []
     
-    # Primary: AudD - no signup, no API key, works great!
-    if USE_AUDD_API:
-        services.append(("AudD", lookup_audd_api))
-    
-    # Secondary: Shazam (if available)
+    # Primary: Shazam (if available - excellent for partial tracks)
     if SHAZAMIO_AVAILABLE and USE_SHAZAM_API:
         services.append(("Shazam", lookup_shazam))
     
-    # Fallback: AcoustID (for full songs only)
+    # Secondary: AudD - works well but free tier expires
+    if USE_AUDD_API:
+        services.append(("AudD", lookup_audd_api))
+    
+    # Reliable fallback: AcoustID (free forever, no complex dependencies)
     if USE_ACOUSTID_FALLBACK:
         services.append(("AcoustID", lambda data: lookup_acoustid_from_wav(data)))
+    
+    # If no Shazam, promote AcoustID to secondary priority
+    if not SHAZAMIO_AVAILABLE and USE_ACOUSTID_FALLBACK and len(services) >= 2:
+        # Move AcoustID to second position if Shazam isn't available
+        acoustid_service = services.pop()  # Remove from end
+        services.insert(1, acoustid_service)  # Insert after AudD
     
     for service_name, service_func in services:
         print(f"DEBUG: Trying {service_name}...")
@@ -872,13 +1299,147 @@ def identify_track_multiple_services(wav_data):
             result = service_func(wav_data)
             if result and result.get('artist') and result.get('title'):
                 print(f"DEBUG: ✅ {service_name} success: {result['artist']} - {result['title']}")
+                
+                # If we don't have album art yet, try to fetch it
+                if not result.get('album_art'):
+                    print(f"DEBUG: 🖼️ Fetching album art for: {result['artist']} - {result['title']}")
+                    album_art = fetch_album_art(result['artist'], result['title'])
+                    if album_art:
+                        result['album_art'] = album_art
+                        print(f"DEBUG: ✅ Album art found!")
+                    else:
+                        print(f"DEBUG: ❌ No album art found")
+                
                 return result
             else:
                 print(f"DEBUG: ❌ {service_name} - no match")
         except Exception as e:
             print(f"DEBUG: ❌ {service_name} error: {e}")
+            if "rate limit" in str(e).lower() or "429" in str(e):
+                print(f"DEBUG: 💡 {service_name} rate limited - trying next service...")
+            continue
     
     print("DEBUG: No services could identify the track")
+    return None
+
+def fetch_album_art(artist, title):
+    """Fetch album art from multiple free sources"""
+    # Try multiple sources in order of preference
+    sources = [
+        ("Last.fm", fetch_lastfm_album_art),
+        ("MusicBrainz", fetch_musicbrainz_album_art),
+        ("iTunes", fetch_itunes_album_art)
+    ]
+    
+    for source_name, fetch_func in sources:
+        try:
+            print(f"DEBUG: Trying {source_name} for album art...")
+            album_art_url = fetch_func(artist, title)
+            if album_art_url:
+                print(f"DEBUG: ✅ Found album art from {source_name}")
+                return album_art_url
+            else:
+                print(f"DEBUG: ❌ No album art from {source_name}")
+        except Exception as e:
+            print(f"DEBUG: ❌ {source_name} album art error: {e}")
+            continue
+    
+    return None
+
+def fetch_lastfm_album_art(artist, title):
+    """Fetch album art from Last.fm (free, no API key required)"""
+    try:
+        # Last.fm API endpoint (no key required for basic track info)
+        url = "http://ws.audioscrobbler.com/2.0/"
+        params = {
+            'method': 'track.getInfo',
+            'api_key': '7c60c1d9f6d1c5e1c16b8a0c7f6f5c6e',  # Public demo key
+            'artist': artist,
+            'track': title,
+            'format': 'json'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'track' in data and 'album' in data['track']:
+            album = data['track']['album']
+            if 'image' in album:
+                images = album['image']
+                # Find the largest image
+                for img in reversed(images):  # Last.fm puts largest last
+                    if img.get('#text'):
+                        return img['#text']
+    except Exception as e:
+        print(f"DEBUG: Last.fm error: {e}")
+    
+    return None
+
+def fetch_musicbrainz_album_art(artist, title):
+    """Fetch album art via MusicBrainz + Cover Art Archive"""
+    try:
+        # Search for the recording in MusicBrainz
+        search_url = "https://musicbrainz.org/ws/2/recording/"
+        params = {
+            'query': f'artist:"{artist}" AND recording:"{title}"',
+            'fmt': 'json',
+            'limit': 1
+        }
+        headers = {
+            'User-Agent': 'PyNowPlaying/1.0 (contact@example.com)'
+        }
+        
+        response = requests.get(search_url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('recordings'):
+            recording = data['recordings'][0]
+            if 'releases' in recording and recording['releases']:
+                release_id = recording['releases'][0]['id']
+                
+                # Try to get cover art from Cover Art Archive
+                cover_url = f"https://coverartarchive.org/release/{release_id}"
+                cover_response = requests.get(cover_url, timeout=10)
+                if cover_response.status_code == 200:
+                    cover_data = cover_response.json()
+                    if 'images' in cover_data and cover_data['images']:
+                        # Return the front cover if available
+                        for img in cover_data['images']:
+                            if img.get('front', False):
+                                return img.get('image', img.get('thumbnails', {}).get('large'))
+                        # If no front cover, return first image
+                        return cover_data['images'][0].get('image')
+    except Exception as e:
+        print(f"DEBUG: MusicBrainz/Cover Art Archive error: {e}")
+    
+    return None
+
+def fetch_itunes_album_art(artist, title):
+    """Fetch album art from iTunes Search API (free, no key required)"""
+    try:
+        url = "https://itunes.apple.com/search"
+        params = {
+            'term': f"{artist} {title}",
+            'media': 'music',
+            'entity': 'song',
+            'limit': 1
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('results'):
+            result = data['results'][0]
+            artwork_url = result.get('artworkUrl100')
+            if artwork_url:
+                # Convert to higher resolution by changing the size
+                return artwork_url.replace('100x100', '512x512')
+    except Exception as e:
+        print(f"DEBUG: iTunes Search API error: {e}")
+    
     return None
 
 def lookup_acoustid_from_wav(wav_data):
@@ -927,7 +1488,13 @@ def lookup_musicbrainz_direct(mbid):
         
         if artist and title:
             print(f"DEBUG: MusicBrainz direct result: {artist} - {title}")
-            return {'artist': artist, 'title': title, 'mbid': mbid}
+            return {
+                'artist': artist, 
+                'title': title, 
+                'service': 'MusicBrainz', 
+                'album_art': None,  # MusicBrainz direct doesn't include album art
+                'mbid': mbid
+            }
         
         return None
         
@@ -1005,8 +1572,15 @@ def lookup_acoustid(fingerprint, duration):
                 title = rec.get('title', '')
                 mbid = rec.get('id', '')
                 
+                # Extract album information if available
+                album = 'Unknown Album'
+                if 'releasegroups' in rec and rec['releasegroups']:
+                    album = rec['releasegroups'][0].get('title', 'Unknown Album')
+                
                 if artist and title:
                     print(f"DEBUG: Selected AcoustID match: {artist} - {title}")
+                    if album != 'Unknown Album':
+                        print(f"DEBUG: Album: {album}")
                     
                     # Optionally try MusicBrainz direct query for additional metadata
                     if mbid and USE_MUSICBRAINZ_DIRECT:
@@ -1020,7 +1594,14 @@ def lookup_acoustid(fingerprint, duration):
                     elif mbid:
                         print(f"DEBUG: MBID available: {mbid} (direct MusicBrainz lookup disabled)")
                     
-                    return {'artist': artist, 'title': title, 'mbid': mbid}
+                    return {
+                        'artist': artist, 
+                        'title': title, 
+                        'service': 'AcoustID',
+                        'album_art': None,  # AcoustID doesn't provide album art
+                        'album': album,
+                        'mbid': mbid
+                    }
                     
         print("DEBUG: No recordings with both artist and title found")
         return None
@@ -1040,10 +1621,10 @@ def track_changed(new_track):
             new_track.get("title") != current_track.get("title"))
 
 def audio_loop(device_index):
-    global current_track, track_history
-    print("DEBUG: Starting audio loop...")
+    global current_track, track_history, last_identified_track, consecutive_match_count
+    print(f"DEBUG: Starting audio loop...")
     print(f"DEBUG: Recording {CHUNK_SECONDS}s chunks for track identification")
-    print(f"DEBUG: Primary service: AudD API (free, no signup required)")
+    print(f"DEBUG: Service priority: Shazam (free forever) → AudD (trial) → AcoustID (free forever)")
     
     while True:
         print(f"\nDEBUG: === Starting new {CHUNK_SECONDS}s audio chunk ===")
@@ -1058,21 +1639,49 @@ def audio_loop(device_index):
         track_info = identify_track_multiple_services(wav_data)
         
         if track_info:
+            # Create a unique identifier for the track
+            track_id = f"{track_info['artist']} - {track_info['title']}"
+            
+            # Check for consecutive matches
+            if last_identified_track == track_id:
+                consecutive_match_count += 1
+                print(f"DEBUG: 🔄 Consecutive match #{consecutive_match_count}: {track_id}")
+            else:
+                consecutive_match_count = 1
+                last_identified_track = track_id
+                print(f"DEBUG: 🆕 New identification: {track_id}")
+            
+            # Handle track changes and consecutive match delays
             if track_changed(track_info):
                 now_str = datetime.now().strftime("%H:%M:%S")
-                source = track_info.get('source', 'unknown')
+                source = track_info.get('service', track_info.get('source', 'unknown'))
                 print(f"DEBUG: 🎵 Track changed: {track_info['artist']} - {track_info['title']} at {now_str} (via {source})")
                 current_track = {
                     "artist": track_info['artist'],
                     "title": track_info['title'],
-                    "time": now_str
+                    "time": now_str,
+                    "album_art": track_info.get('album_art', ''),
+                    "album": track_info.get('album', 'Unknown Album')
                 }
                 track_history.insert(0, current_track.copy())
                 # Keep last 20 tracks
                 track_history = track_history[:20]
+                
+                # Reset consecutive count on track change
+                consecutive_match_count = 1
             else:
-                source = track_info.get('source', 'unknown')
+                source = track_info.get('service', track_info.get('source', 'unknown'))
                 print(f"DEBUG: 🔄 Same track detected: {track_info['artist']} - {track_info['title']} (via {source})")
+            
+            # Apply extended delay for consecutive matches
+            if consecutive_match_count >= 2:
+                print(f"DEBUG: ⏸️  Extended delay: Same track identified {consecutive_match_count} times in a row")
+                print(f"DEBUG: ⏳ Waiting 30 seconds to avoid service spam...")
+                time.sleep(30)
+            else:
+                # Wait before next sample (normal delay for sustainable Shazam usage)
+                print(f"DEBUG: ⏳ Waiting before next {CHUNK_SECONDS}s sample...")
+                time.sleep(8)  # Normal delay to avoid rate limiting
         else:
             print("DEBUG: ❌ No match found across all services.")
             print("DEBUG: 💡 Tips for better recognition:")
@@ -1080,10 +1689,14 @@ def audio_loop(device_index):
             print("DEBUG:   - Try popular/mainstream songs (better database coverage)")
             print("DEBUG:   - Check audio levels are good (not too quiet/loud)")
             print("DEBUG:   - Reduce background noise and talking")
-        
-        # Wait before next sample
-        print(f"DEBUG: ⏳ Waiting before next {CHUNK_SECONDS}s sample...")
-        time.sleep(3)
+            
+            # Reset consecutive tracking when no match found
+            last_identified_track = None
+            consecutive_match_count = 0
+            
+            # Wait before next sample (normal delay)
+            print(f"DEBUG: ⏳ Waiting before next {CHUNK_SECONDS}s sample...")
+            time.sleep(8)
 
 @app.route("/")
 def index():
@@ -1099,9 +1712,15 @@ def start_flask():
 def main():
     print("🎵 PyNowPlaying - Audio Track Recognition")
     print("=" * 50)
-    print("🎯 Primary Service: AudD API (free, no signup required!)")
+    print("🎯 Multiple Service Support for Long-term Sustainability")
     print("📡 Real-time track identification optimized for partial audio")
     print("=" * 50)
+    
+    # Clean up any leftover temporary files from previous runs
+    cleanup_temp_files()
+    
+    # Show service status and recommendations
+    print_service_status()
     
     device_index = find_input_device()
     print(f"\n✅ Using audio input device index: {device_index}")
@@ -1133,8 +1752,8 @@ def main():
     print("🎵 STARTING MUSIC DETECTION")
     print(f"{'='*50}")
     print("🌐 Web interface: http://127.0.0.1:5000")
-    print("🎯 Service: AudD API (free tier)")
-    print("⏱️  Sample rate: 15 seconds")
+    print("🎯 Services: Shazam (primary) → AudD (trial) → AcoustID (fallback)")
+    print(f"⏱️  Sample rate: {CHUNK_SECONDS} seconds")
     print("🛑 Press Ctrl+C to stop")
     print(f"{'='*50}")
 
